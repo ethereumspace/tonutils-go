@@ -330,6 +330,83 @@ func (w *Wallet) BuildExternalMessageForMany(ctx context.Context, messages []*Me
 	return w.PrepareExternalMessageForMany(ctx, !initialized, messages)
 }
 
+func (w *Wallet) BuildExternalMessageForManyWithSeq(ctx context.Context, messages []*Message, seq uint32) (*tlb.ExternalMessage, error) {
+	block, err := w.api.CurrentMasterchainInfo(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get block: %w", err)
+	}
+
+	acc, err := w.api.WaitForBlock(block.SeqNo).GetAccount(ctx, block, w.addr)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get account state: %w", err)
+	}
+
+	initialized := acc.IsActive && acc.State.Status == tlb.AccountStatusActive
+	return w.PrepareExternalMessageForManyWithSeq(ctx, !initialized, messages, seq)
+}
+
+func (w *Wallet) PrepareExternalMessageForManyWithSeq(ctx context.Context, withStateInit bool, messages []*Message, seq uint32) (_ *tlb.ExternalMessage, err error) {
+	var stateInit *tlb.StateInit
+	if withStateInit {
+		stateInit, err = GetStateInit(w.key.Public().(ed25519.PublicKey), w.ver, w.subwallet)
+		if err != nil {
+			return nil, fmt.Errorf("failed to get state init: %w", err)
+		}
+	}
+
+	var msg *cell.Cell
+	switch v := w.ver.(type) {
+	case Version, ConfigV5R1Beta, ConfigV5R1Final:
+		switch v.(type) {
+		case ConfigV5R1Beta:
+			v = V5R1Beta
+		case ConfigV5R1Final:
+			v = V5R1Final
+		}
+
+		switch v {
+		case V3R2, V3R1, V4R2, V4R1, V5R1Beta, V5R1Final:
+
+			if wv, ok2 := w.spec.(SpecV4R2); ok2 {
+				msg, err = wv.BuildMessageWithSeq(ctx, !withStateInit, nil, messages, uint64(seq))
+				if err != nil {
+					return nil, fmt.Errorf("build message err: %w", err)
+				}
+
+			} else {
+				msg, err = w.spec.(RegularBuilder).BuildMessage(ctx, !withStateInit, nil, messages)
+				if err != nil {
+					return nil, fmt.Errorf("build message err: %w", err)
+				}
+
+			}
+
+		case HighloadV2R2, HighloadV2Verified:
+			msg, err = w.spec.(*SpecHighloadV2R2).BuildMessage(ctx, messages)
+			if err != nil {
+				return nil, fmt.Errorf("build message err: %w", err)
+			}
+		case HighloadV3:
+			return nil, fmt.Errorf("use ConfigHighloadV3 for highload v3 spec")
+		default:
+			return nil, fmt.Errorf("send is not yet supported: %w", ErrUnsupportedWalletVersion)
+		}
+	case ConfigHighloadV3:
+		msg, err = w.spec.(*SpecHighloadV3).BuildMessage(ctx, messages)
+		if err != nil {
+			return nil, fmt.Errorf("build message err: %w", err)
+		}
+	default:
+		return nil, fmt.Errorf("send is not yet supported: %w", ErrUnsupportedWalletVersion)
+	}
+
+	return &tlb.ExternalMessage{
+		DstAddr:   w.addr,
+		StateInit: stateInit,
+		Body:      msg,
+	}, nil
+}
+
 // PrepareExternalMessageForMany - Prepares external message for wallet
 // can be used directly for offline signing but custom fetchers should be defined in this case
 func (w *Wallet) PrepareExternalMessageForMany(ctx context.Context, withStateInit bool, messages []*Message) (_ *tlb.ExternalMessage, err error) {
@@ -460,9 +537,51 @@ func (w *Wallet) SendManyWaitTransaction(ctx context.Context, messages []*Messag
 	return tx, block, err
 }
 
+// SendManyWaitTransaction always waits for tx block confirmation and returns found tx.
+func (w *Wallet) SendManyWaitTransactionWithSeq(ctx context.Context, messages []*Message, seq uint32) (*tlb.Transaction, *ton.BlockIDExt, error) {
+	tx, block, _, err := w.sendManyWithSeq(ctx, messages, seq, true)
+	return tx, block, err
+}
+
 // SendWaitTransaction always waits for tx block confirmation and returns found tx.
 func (w *Wallet) SendWaitTransaction(ctx context.Context, message *Message) (*tlb.Transaction, *ton.BlockIDExt, error) {
 	return w.SendManyWaitTransaction(ctx, []*Message{message})
+}
+
+// SendWaitTransaction always waits for tx block confirmation and returns found tx.
+func (w *Wallet) SendWaitTransactionWithSeq(ctx context.Context, message *Message, seq uint32) (*tlb.Transaction, *ton.BlockIDExt, error) {
+	return w.SendManyWaitTransactionWithSeq(ctx, []*Message{message}, seq)
+}
+
+func (w *Wallet) sendManyWithSeq(ctx context.Context, messages []*Message, seq uint32, waitConfirmation ...bool) (tx *tlb.Transaction, block *ton.BlockIDExt, inMsgHash []byte, err error) {
+	block, err = w.api.CurrentMasterchainInfo(ctx)
+	if err != nil {
+		return nil, nil, nil, fmt.Errorf("failed to get block: %w", err)
+	}
+
+	acc, err := w.api.WaitForBlock(block.SeqNo).GetAccount(ctx, block, w.addr)
+	if err != nil {
+		return nil, nil, nil, fmt.Errorf("failed to get account state: %w", err)
+	}
+
+	ext, err := w.BuildExternalMessageForManyWithSeq(ctx, messages, seq)
+	if err != nil {
+		return nil, nil, nil, err
+	}
+	inMsgHash = ext.Body.Hash()
+
+	if err = w.api.SendExternalMessage(ctx, ext); err != nil {
+		return nil, nil, nil, fmt.Errorf("failed to send message: %w", err)
+	}
+
+	if len(waitConfirmation) > 0 && waitConfirmation[0] {
+		tx, block, err = w.waitConfirmation(ctx, block, acc, ext)
+		if err != nil {
+			return nil, nil, nil, err
+		}
+	}
+
+	return tx, block, inMsgHash, nil
 }
 
 func (w *Wallet) sendMany(ctx context.Context, messages []*Message, waitConfirmation ...bool) (tx *tlb.Transaction, block *ton.BlockIDExt, inMsgHash []byte, err error) {
