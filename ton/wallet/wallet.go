@@ -368,11 +368,18 @@ func (w *Wallet) PrepareExternalMessageForManyWithSeq(ctx context.Context, withS
 		case V3R2, V3R1, V4R2, V4R1, V5R1Beta, V5R1Final:
 
 			if wv, ok2 := w.spec.(SpecV4R2); ok2 {
+				fmt.Println("build msg with seq", seq)
 				msg, err = wv.BuildMessageWithSeq(ctx, !withStateInit, nil, messages, uint64(seq))
 				if err != nil {
 					return nil, fmt.Errorf("build message err: %w", err)
 				}
 
+			} else if wv2, ok2 := w.spec.(*SpecV4R2); ok2 {
+				fmt.Println("build msg with seq2", seq)
+				msg, err = wv2.BuildMessageWithSeq(ctx, !withStateInit, nil, messages, uint64(seq))
+				if err != nil {
+					return nil, fmt.Errorf("build message err: %w", err)
+				}
 			} else {
 				msg, err = w.spec.(RegularBuilder).BuildMessage(ctx, !withStateInit, nil, messages)
 				if err != nil {
